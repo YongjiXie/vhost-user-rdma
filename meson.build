@@ -14,6 +14,7 @@ executable('vhost-user-rdma',
     'virtio_net.c',
     'vhost_rdma.c',
     'verbs.c',
+    'vhost_rdma_pool.c',
   ],
   dependencies: dpdk,
   c_args: [
