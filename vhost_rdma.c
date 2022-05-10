@@ -29,7 +29,8 @@
 #include "virtio_net.h"
 #include "vhost_rdma.h"
 #include "vhost_user.h"
-#include "logging.h"
+#include "vhost_rdma_ib.h"
+#include "vhost_rdma_loc.h"
 
 struct vhost_rdma_dev g_vhost_rdma_dev;
 
@@ -56,6 +57,7 @@ static void
 destroy_device(__rte_unused int vid)
 {
 	struct vhost_rdma_dev *dev;
+	struct vhost_queue *vq;
 
 	dev = &g_vhost_rdma_dev;
 
@@ -69,6 +71,18 @@ destroy_device(__rte_unused int vid)
 		rte_pause();
 	}
 	vs_vhost_net_remove();
+	vhost_rdma_destroy_ib(dev);
+
+	for (int i = 0; i < NUM_VHOST_QUEUES; i++) {
+		vq = &dev->vqs[i];
+
+		rte_vhost_set_vring_base(dev->vid, i,
+					 vq->last_avail_idx,
+					 vq->last_used_idx);
+
+		vq->enabled = false;
+	}
+
 	free(dev->mem);
 }
 
@@ -141,6 +155,22 @@ vring_state_changed(int vid, uint16_t queue_id, int enable) {
 						&vq->last_avail_idx,
 						&vq->last_used_idx) == 0);
 		vq->enabled = true;
+		/*
+		 * ctrl_handler MUST start when the virtqueue is enabled,
+		 * NOT start in new_device(). because driver will query some
+		 * informations through ctrl vq in ib_register_device() when
+		 * the device is not enabled.
+		 */
+		if (queue_id == VHOST_NET_ROCE_CTRL_QUEUE && !dev->ctrl_intr_registed) {
+			assert(rte_vhost_get_mem_table(vid, &dev->mem) == 0);
+			assert(dev->mem != NULL);
+
+			dev->ctrl_intr_handle.fd = dev->vqs[VHOST_NET_ROCE_CTRL_QUEUE].vring.kickfd;
+			dev->ctrl_intr_handle.type = RTE_INTR_HANDLE_EXT;
+			rte_intr_callback_register(&dev->ctrl_intr_handle,
+						   vhost_rdma_handle_ctrl, dev);
+			dev->ctrl_intr_registed = 1;
+		}
 	}
 	return 0;
 }
@@ -166,8 +196,14 @@ vhost_rdma_install_rte_compat_hooks(const char *path)
 void
 vhost_rdma_destroy(const char* path)
 {
+	struct vhost_rdma_dev *dev;
+
+	dev = &g_vhost_rdma_dev;
+
 	RDMA_LOG_INFO("vhost rdma destroy");
 
+	rte_intr_callback_unregister(&dev->ctrl_intr_handle,
+					vhost_rdma_handle_ctrl, dev);
 	rte_vhost_driver_unregister(path);
 }
 
@@ -197,7 +233,12 @@ vhost_rdma_construct(const char *path) {
 	/* set vhost user protocol features */
 	vhost_rdma_install_rte_compat_hooks(path);
 
+	dev->rdma_vqs = &dev->vqs[VHOST_NET_ROCE_CTRL_QUEUE];
+
 	vs_vhost_net_construct(dev->vqs);
+
+	vhost_rdma_init_ib(dev);
+	rte_spinlock_init(&dev->port_lock);
 
 	rte_vhost_driver_callback_register(path,
 					   &vhost_rdma_device_ops);
