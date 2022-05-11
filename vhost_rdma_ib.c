@@ -413,7 +413,9 @@ vhost_rdma_create_qp(struct vhost_rdma_dev *dev, struct iovec *in,
 
 	rsp->qpn = qpn;
 
-	RDMA_LOG_INFO("create qp %u type: %d", qp->qpn, cmd->qp_type);
+	RDMA_LOG_INFO("create qp %u type: %d sq %u rq %u scq %u rcq %u",
+		      qp->qpn, cmd->qp_type, qp->sq.queue.vq->id, qp->rq.queue.vq->id,
+		      cmd->send_cqn, cmd->recv_cqn);
 
 	return 0;
 }
@@ -721,6 +723,8 @@ vhost_rdma_destroy_ib(struct vhost_rdma_dev *dev) {
 	for (i = 0; i < dev->config.max_rdma_qps; i++) {
 		qp = vhost_rdma_pool_get(&dev->qp_pool, i);
 		if (qp) {
+			vhost_rdma_queue_cleanup(qp, &qp->sq.queue);
+			vhost_rdma_queue_cleanup(qp, &qp->rq.queue);
 			vhost_rdma_pool_free(&dev->qp_pool, i);
 		}
 	}

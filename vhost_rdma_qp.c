@@ -28,7 +28,82 @@
 #include "vhost_rdma.h"
 #include "vhost_rdma_ib.h"
 #include "vhost_rdma_loc.h"
+#include "vhost_rdma_hdr.h"
 #include "virtio_rdma_abi.h"
+
+static int vhost_rdma_qp_init_req(__rte_unused struct vhost_rdma_dev *dev,
+				struct vhost_rdma_qp *qp,
+				struct virtio_rdma_cmd_create_qp *cmd)
+{
+	int wqe_size;
+
+	qp->src_port = 0xc000;
+
+	/* These caps are limited by rxe_qp_chk_cap() done by the caller */
+	wqe_size = RTE_MAX(cmd->cap.max_send_sge * sizeof(struct virtio_rdma_sge),
+			 cmd->cap.max_inline_data);
+	vhost_rdma_queue_init(qp, &qp->sq.queue, "sq_queue",
+			&dev->qp_vqs[qp->qpn * 2], sizeof(struct vhost_rdma_send_wqe) + wqe_size, VHOST_RDMA_QUEUE_SQ);
+
+	qp->req.state		= QP_STATE_RESET;
+	qp->req.opcode		= -1;
+	qp->comp.opcode		= -1;
+
+	qp->req_pkts = rte_zmalloc(NULL, rte_ring_get_memsize(512), RTE_CACHE_LINE_SIZE);
+	if (qp->req_pkts == NULL) {
+		RDMA_LOG_ERR("req_pkts malloc failed");
+		return -ENOMEM;
+	}
+	if (rte_ring_init(qp->req_pkts, "req_pkts", 512, RING_F_MP_HTS_ENQ | RING_F_MC_HTS_DEQ) != 0) {
+		RDMA_LOG_ERR("req_pkts init failed");
+		rte_free(qp->req_pkts);
+		return -ENOMEM;
+	}
+	// qp->req_pkts = rte_ring_create("req_pkts", 512, rte_socket_id(), RING_F_MP_HTS_ENQ | RING_F_MC_HTS_DEQ);
+	RDMA_LOG_DEBUG("req pkts qp%p %p", qp, qp->req_pkts);
+	qp->req_pkts_head = NULL;
+
+	vhost_rdma_init_task(&qp->req.task, dev->task_ring, qp,
+			vhost_rdma_requester, "req");
+	vhost_rdma_init_task(&qp->comp.task, dev->task_ring, qp,
+			vhost_rdma_completer, "comp");
+
+	qp->qp_timeout_ticks = 0; /* Can't be set for UD/UC in modify_qp */
+	if (cmd->qp_type == VIRTIO_IB_QPT_RC) {
+		rte_timer_init(&qp->rnr_nak_timer); // req_task
+		rte_timer_init(&qp->retrans_timer); // comp_task
+	}
+	return 0;
+}
+
+static int vhost_rdma_qp_init_resp(struct vhost_rdma_dev *dev,
+				   struct vhost_rdma_qp *qp)
+{
+	if (!qp->srq) {
+		vhost_rdma_queue_init(qp, &qp->rq.queue, "rq_queue",
+			&dev->qp_vqs[qp->qpn * 2 + 1], sizeof(struct vhost_rdma_recv_wqe), VHOST_RDMA_QUEUE_RQ);
+	}
+
+	qp->resp_pkts = rte_zmalloc(NULL, rte_ring_get_memsize(512), RTE_CACHE_LINE_SIZE);
+	if (qp->resp_pkts == NULL) {
+		RDMA_LOG_ERR("resp_pkts malloc failed");
+		return -ENOMEM;
+	}
+	if (rte_ring_init(qp->resp_pkts, "resp_pkts", 512, RING_F_MP_HTS_ENQ | RING_F_MC_HTS_DEQ) != 0) {
+		RDMA_LOG_ERR("resp_pkts init failed");
+		rte_free(qp->resp_pkts);
+		return -ENOMEM;
+	}
+
+	vhost_rdma_init_task(&qp->resp.task, dev->task_ring, qp,
+			vhost_rdma_responder, "resp");
+
+	qp->resp.opcode		= OPCODE_NONE;
+	qp->resp.msn		= 0;
+	qp->resp.state		= QP_STATE_RESET;
+
+	return 0;
+}
 
 static void vhost_rdma_qp_init_misc(__rte_unused struct vhost_rdma_dev *dev,
 				    struct vhost_rdma_qp *qp,
@@ -45,11 +120,16 @@ static void vhost_rdma_qp_init_misc(__rte_unused struct vhost_rdma_dev *dev,
 	qp->attr.cap.max_inline_data = cmd->cap.max_inline_data;
 
 	rte_spinlock_init(&qp->state_lock);
+
+	rte_atomic32_set(&qp->ssn, 0);
+	rte_atomic32_set(&qp->mbuf_out, 0);
 }
 
 int vhost_rdma_qp_init(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 		       struct virtio_rdma_cmd_create_qp *cmd)
 {
+	int err;
+
 	qp->pd = vhost_rdma_pool_get(&dev->pd_pool, cmd->pdn);
 	qp->scq = vhost_rdma_pool_get(&dev->cq_pool, cmd->send_cqn);
 	qp->rcq = vhost_rdma_pool_get(&dev->cq_pool, cmd->recv_cqn);
@@ -59,17 +139,63 @@ int vhost_rdma_qp_init(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 
 	vhost_rdma_qp_init_misc(dev, qp, cmd);
 
+	err = vhost_rdma_qp_init_req(dev, qp, cmd);
+	if (err)
+		goto err;
+
+	err = vhost_rdma_qp_init_resp(dev, qp);
+	if (err)
+		goto err;
+
 	qp->attr.qp_state = VIRTIO_IB_QPS_RESET;
 	qp->valid = 1;
 	qp->type = cmd->qp_type;
 	qp->dev = dev;
 
 	return 0;
+
+err:
+	qp->pd = NULL;
+	qp->rcq = NULL;
+	qp->scq = NULL;
+	vhost_rdma_drop_ref(qp->pd, dev, pd);
+	vhost_rdma_drop_ref(qp->rcq, dev, cq);
+	vhost_rdma_drop_ref(qp->scq, dev, cq);
+
+	return err;
 }
 
 void vhost_rdma_qp_destroy(struct vhost_rdma_qp *qp)
 {
 	qp->valid = 0;
+	qp->qp_timeout_ticks = 0;
+	vhost_rdma_cleanup_task(&qp->resp.task);
+
+	if (qp->type == VIRTIO_IB_QPT_RC) {
+		rte_timer_stop_sync(&qp->retrans_timer);
+		rte_timer_stop_sync(&qp->rnr_nak_timer);
+	}
+
+	vhost_rdma_cleanup_task(&qp->req.task);
+	vhost_rdma_cleanup_task(&qp->comp.task);
+
+	/* flush out any receive wr's or pending requests */
+	__vhost_rdma_do_task(&qp->req.task);
+	if (qp->sq.queue.vq) {
+		__vhost_rdma_do_task(&qp->comp.task);
+		__vhost_rdma_do_task(&qp->req.task);
+	}
+
+	vhost_rdma_queue_cleanup(qp, &qp->sq.queue);
+	vhost_rdma_queue_cleanup(qp, &qp->rq.queue);
+
+	qp->sq.queue.vq->last_avail_idx = 0;
+	qp->sq.queue.vq->last_used_idx = 0;
+	qp->rq.queue.vq->last_avail_idx = 0;
+	qp->rq.queue.vq->last_used_idx = 0;
+
+	rte_free(qp->req_pkts);
+	rte_free(qp->resp_pkts);
 }
 
 int vhost_rdma_qp_query(struct vhost_rdma_qp *qp,
@@ -90,7 +216,7 @@ int vhost_rdma_qp_query(struct vhost_rdma_qp *qp,
 
 	rsp->rq_psn = qp->resp.psn;
 	rsp->sq_psn = qp->req.psn;
-	
+
 	rsp->cap.max_send_wr = qp->attr.cap.max_send_wr;
 	rsp->cap.max_send_sge = qp->attr.cap.max_send_sge;
 	rsp->cap.max_inline_data = qp->attr.cap.max_inline_data;
@@ -191,11 +317,54 @@ int vhost_rdma_qp_validate(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 	return 0;
 }
 
+static int
+alloc_rd_atomic_resources(struct vhost_rdma_qp *qp, unsigned int n)
+{
+	qp->resp.res_head = 0;
+	qp->resp.res_tail = 0;
+
+	if (n == 0) {
+		qp->resp.resources = NULL;
+	} else {
+		qp->resp.resources = rte_zmalloc(NULL, sizeof(struct resp_res) * n, 0);
+		if (!qp->resp.resources)
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+void
+free_rd_atomic_resource(__rte_unused struct vhost_rdma_qp *qp, struct resp_res *res)
+{
+	if (res->type == VHOST_ATOMIC_MASK) {
+		rte_pktmbuf_free(res->atomic.mbuf);
+	} else if (res->type == VHOST_READ_MASK) {
+		if (res->read.mr)
+			vhost_rdma_drop_ref(res->read.mr, qp->dev, mr);
+	}
+	res->type = 0;
+}
+
+static void
+free_rd_atomic_resources(struct vhost_rdma_qp *qp)
+{
+	if (qp->resp.resources) {
+		for (int i = 0; i < qp->attr.max_dest_rd_atomic; i++) {
+			struct resp_res *res = &qp->resp.resources[i];
+
+			free_rd_atomic_resource(qp, res);
+		}
+		rte_free(qp->resp.resources);
+		qp->resp.resources = NULL;
+	}
+}
+
 int
 vhost_rdma_qp_modify(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 		     struct virtio_rdma_cmd_modify_qp *cmd)
 {
-	int mask = cmd->attr_mask;
+	int err, mask = cmd->attr_mask;
 
 	if (mask & VIRTIO_IB_QP_MAX_QP_RD_ATOMIC) {
 		int max_rd_atomic = cmd->max_rd_atomic ?
@@ -210,6 +379,12 @@ vhost_rdma_qp_modify(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 			roundup_pow_of_two(cmd->max_dest_rd_atomic) : 0;
 
 		qp->attr.max_dest_rd_atomic = max_dest_rd_atomic;
+
+		free_rd_atomic_resources(qp);
+
+		err = alloc_rd_atomic_resources(qp, max_dest_rd_atomic);
+		if (err)
+			return err;
 	}
 
 	if (mask & VIRTIO_IB_QP_CUR_STATE)
@@ -255,7 +430,7 @@ vhost_rdma_qp_modify(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 	}
 
 	if (mask & VIRTIO_IB_QP_RQ_PSN) {
-		qp->attr.rq_psn = cmd->rq_psn;
+		qp->attr.rq_psn = (cmd->rq_psn & BTH_PSN_MASK);
 		qp->resp.psn = qp->attr.rq_psn;
 		RDMA_LOG_INFO("qp#%d set resp psn = 0x%x", qp->qpn,
 			 qp->resp.psn);
@@ -268,7 +443,7 @@ vhost_rdma_qp_modify(struct vhost_rdma_dev *dev, struct vhost_rdma_qp *qp,
 	}
 
 	if (mask & VIRTIO_IB_QP_SQ_PSN) {
-		qp->attr.sq_psn = cmd->sq_psn;
+		qp->attr.sq_psn = (cmd->sq_psn & BTH_PSN_MASK);
 		qp->req.psn = qp->attr.sq_psn;
 		qp->comp.psn = qp->attr.sq_psn;
 		RDMA_LOG_INFO("qp#%d set req psn = 0x%x", qp->qpn, qp->req.psn);
@@ -328,6 +503,15 @@ vhost_rdma_qp_error(struct vhost_rdma_qp *qp)
 	qp->req.state = QP_STATE_ERROR;
 	qp->resp.state = QP_STATE_ERROR;
 	qp->attr.qp_state = VIRTIO_IB_QPS_ERR;
+
+	/* drain work and packet queues */
+	vhost_rdma_run_task(&qp->resp.task, 1);
+
+	if (qp->type == VIRTIO_IB_QPT_RC)
+		vhost_rdma_run_task(&qp->comp.task, 1);
+	else
+		__vhost_rdma_do_task(&qp->comp.task);
+	vhost_rdma_run_task(&qp->req.task, 1);
 }
 
 void vhost_rdma_qp_cleanup(void* arg)
@@ -343,4 +527,11 @@ void vhost_rdma_qp_cleanup(void* arg)
 		vhost_rdma_drop_ref(qp->rcq, qp->dev, cq);
 	if (qp->pd)
 		vhost_rdma_drop_ref(qp->pd, qp->dev, pd);
+
+	if (qp->resp.mr) {
+		vhost_rdma_drop_ref(qp->resp.mr, qp->dev, mr);
+		qp->resp.mr = NULL;
+	}
+
+	free_rd_atomic_resources(qp);
 }

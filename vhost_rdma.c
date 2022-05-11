@@ -48,7 +48,7 @@ new_device(int vid)
 	vs_vhost_net_setup(vid);
 	/* device has been started */
 	dev->started = 1;
-	dev->state = VHOST_STATE_STARTED;
+	dev->stopped = false;
 
 	return 0;
 }
@@ -65,11 +65,12 @@ destroy_device(__rte_unused int vid)
 		return;
 
 	dev->started = 0;
-	dev->state = VHOST_STATE_STOPPED;
+	dev->stopped = true;
 
-	while(dev->state != VHOST_STATE_REMOVED) {
+	while (dev->inuse == 0) {
 		rte_pause();
 	}
+
 	vs_vhost_net_remove();
 	vhost_rdma_destroy_ib(dev);
 
@@ -199,6 +200,9 @@ vhost_rdma_destroy(const char* path)
 	struct vhost_rdma_dev *dev;
 
 	dev = &g_vhost_rdma_dev;
+	if (dev->task_ring)
+		rte_ring_free(dev->task_ring);
+	dev->task_ring = NULL;
 
 	RDMA_LOG_INFO("vhost rdma destroy");
 
@@ -208,7 +212,8 @@ vhost_rdma_destroy(const char* path)
 }
 
 int
-vhost_rdma_construct(const char *path) {
+vhost_rdma_construct(const char *path, struct rte_mempool *mbuf_pool,
+		     struct rte_ring* tx_ring, struct rte_ring* rx_ring) {
 	struct vhost_rdma_dev *dev = &g_vhost_rdma_dev;
 	int ret;
 
@@ -228,7 +233,8 @@ vhost_rdma_construct(const char *path) {
 		return ret;
 	}
 
-	dev->state = VHOST_STATE_READY;
+	dev->stopped = false;
+	dev->inuse = 0;
 
 	/* set vhost user protocol features */
 	vhost_rdma_install_rte_compat_hooks(path);
@@ -242,5 +248,20 @@ vhost_rdma_construct(const char *path) {
 
 	rte_vhost_driver_callback_register(path,
 					   &vhost_rdma_device_ops);
+
+	dev->mbuf_pool = mbuf_pool;
+	dev->tx_ring = tx_ring;
+	dev->rx_ring = rx_ring;
+
+	dev->task_ring = rte_ring_create("rdma_task_ring",
+			roundup_pow_of_two(dev->config.max_rdma_qps * 3),
+			rte_socket_id(), RING_F_MP_HTS_ENQ | RING_F_MC_HTS_DEQ);
+
+	for (int i = 0; i < VHOST_NUM_OF_COUNTERS; i++) {
+		rte_atomic64_init(&dev->stats_counters[i]);
+	}
+
+	rte_eal_mp_remote_launch(vhost_rdma_scheduler, dev, SKIP_MAIN);
+
 	return 0;
 }

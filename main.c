@@ -37,6 +37,7 @@
 #include "virtio_net.h"
 #include "vhost_rdma.h"
 #include "logging.h"
+#include "vhost_rdma_hdr.h"
 
 static struct rte_eth_conf port_conf_default;
 static struct rte_eth_conf port_conf_offload = {
@@ -46,6 +47,9 @@ static struct rte_eth_conf port_conf_offload = {
 };
 
 static struct rte_mempool *mbuf_pool;
+
+static struct rte_ring* rdma_rx_ring;
+static struct rte_ring* rdma_tx_ring;
 
 static char dev_pathname[PATH_MAX] = "/tmp/vhost-rdma0";
 
@@ -64,6 +68,14 @@ struct udpv6_hdr {
 	struct rte_ipv6_hdr ipv6;
 	struct rte_udp_hdr udp;
 } __rte_aligned(2);
+
+static __rte_always_inline void
+rdma_rx_one(struct rte_mbuf *pkt) {
+	if (unlikely(rte_ring_enqueue(rdma_rx_ring, pkt) != 0)) {
+		rte_pktmbuf_free(pkt);
+		LOG_DEBUG_DP("rdma rx drop one pkt");
+	}
+}
 
 /*
  * there is no need to change mac address of pkts,
@@ -101,6 +113,22 @@ eth_rx() {
 			LOG_DEBUG_DP("rx drop %d pkts", nb_rx_pkts - nb_tx_pkts);
 		}
 	}
+
+	/* send rdma pkts */
+	nb_rx_pkts = rte_ring_dequeue_burst(rdma_tx_ring, (void**)pkts,
+					    MAX_PKTS_BURST, NULL);
+	if (nb_rx_pkts != 0) {
+		LOG_DEBUG_DP("rx got %d rdma packets", nb_rx_pkts);
+
+		nb_tx_pkts = rte_eth_tx_burst(pair_port_id, 0, pkts, nb_rx_pkts);
+		if (unlikely(nb_tx_pkts < nb_rx_pkts)) {
+			uint16_t buf;
+
+			for (buf = nb_tx_pkts; buf < nb_rx_pkts; buf++)
+				rte_pktmbuf_free(pkts[buf]);
+			LOG_DEBUG_DP("rx drop %d rdma pkts", nb_rx_pkts - nb_tx_pkts);
+		}
+	}
 }
 
 /*
@@ -111,6 +139,8 @@ static __rte_always_inline void
 eth_tx() {
 	struct rte_mbuf *pkts[MAX_PKTS_BURST];
 	uint16_t nb_rx_pkts;
+	struct udpv4_hdr *udpv4;
+	struct udpv6_hdr *udpv6;
 
 	nb_rx_pkts = rte_eth_rx_burst(pair_port_id, 0, pkts, MAX_PKTS_BURST);
 	if (nb_rx_pkts == 0) {
@@ -131,6 +161,23 @@ eth_tx() {
 #endif
 
 	for (int i = 0; i < nb_rx_pkts; i++) {
+		/* check if pkt is rocev2 */
+		udpv4 = rte_pktmbuf_mtod(pkts[i], struct udpv4_hdr *);
+		if (rte_be_to_cpu_16(udpv4->ether.ether_type) == RTE_ETHER_TYPE_IPV4 &&
+		    udpv4->ipv4.next_proto_id == IPPROTO_UDP &&
+			udpv4->udp.dst_port == htons(ROCE_V2_UDP_DPORT)) {
+			rdma_rx_one(pkts[i]);
+			continue;
+		}
+
+		udpv6 = rte_pktmbuf_mtod(pkts[i], struct udpv6_hdr *);
+		if (rte_be_to_cpu_16(udpv6->ether.ether_type) == RTE_ETHER_TYPE_IPV6 &&
+		    udpv6->ipv6.proto == IPPROTO_UDP &&
+			udpv6->udp.dst_port == htons(ROCE_V2_UDP_DPORT)) {
+			rdma_rx_one(pkts[i]);
+			continue;
+		}
+
 		/* forward pkt to vhost_net */
 		if (unlikely(vs_enqueue_pkts(VHOST_NET_RXQ, &pkts[i], 1) != 1)) {
 			rte_pktmbuf_free(pkts[i]);
@@ -142,12 +189,13 @@ eth_tx() {
 static int
 eth_main_loop(__rte_unused void* arg) {
 	LOG_INFO("ethernet main loop started");
-	while (!force_quit && g_vhost_rdma_dev.state < VHOST_STATE_STOPPED) {
+	g_vhost_rdma_dev.inuse++;
+	while (!force_quit && !g_vhost_rdma_dev.stopped) {
 		eth_rx();
 
 		eth_tx();
 	}
-	g_vhost_rdma_dev.state = VHOST_STATE_REMOVED;
+	g_vhost_rdma_dev.inuse--;
 	LOG_INFO("ethernet main loop quit");
 	return 0;
 }
@@ -285,8 +333,20 @@ main(int argc, char **argv)
 
 	/* init mempool */
 	mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", 65535,
-			250, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+			250, sizeof(struct vhost_rdma_pkt_info),
+			RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (mbuf_pool == NULL)
+		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
+
+	/* init rdma tx/rx ring */
+	rdma_rx_ring = rte_ring_create("rdma_rx_ring", 1024, rte_socket_id(),
+					RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
+	if (rdma_rx_ring == NULL)
+		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
+
+	rdma_tx_ring = rte_ring_create("rdma_tx_ring", 1024, rte_socket_id(),
+					RING_F_MP_HTS_ENQ | RING_F_SC_DEQ);
+	if (rdma_tx_ring == NULL)
 		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
 
 	/* init eth_dev */
@@ -307,7 +367,7 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "tap dev not found");
 
 	/* init vhost rdma */
-	vhost_rdma_construct(dev_pathname);
+	vhost_rdma_construct(dev_pathname, mbuf_pool, rdma_tx_ring, rdma_rx_ring);
 
 	rte_vhost_driver_start(dev_pathname);
 

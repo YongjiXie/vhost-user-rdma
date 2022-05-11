@@ -34,7 +34,7 @@
 #include "verbs.h"
 #include "vhost_rdma.h"
 #include "vhost_rdma_queue.h"
-#include "virtio_rdma_abi.h"
+#include "vhost_rdma_task.h"
 
 #define OPCODE_NONE		(-1)
 
@@ -100,6 +100,60 @@ struct vhost_rdma_av {
 	} sgid_addr, dgid_addr;
 };
 
+struct vhost_rdma_dma_info {
+	uint32_t length;
+	uint32_t resid;
+	uint32_t cur_sge;
+	uint32_t num_sge;
+	uint32_t sge_offset;
+	uint32_t reserved;
+	union {
+		uint8_t *inline_data;
+		struct virtio_rdma_sge *sge;
+		void *raw;
+	};
+};
+
+enum wqe_state {
+	wqe_state_posted,
+	wqe_state_processing,
+	wqe_state_pending,
+	wqe_state_done,
+	wqe_state_error,
+};
+
+struct vhost_rdma_send_wqe {
+	struct virtio_rdma_sq_req *wr;
+	struct vhost_rdma_av av;
+	__u32 status;
+	__u32 state;
+	__aligned_u64 iova;
+	__u32 mask;
+	__u32 first_psn;
+	__u32 last_psn;
+	__u32 ack_length;
+	__u32 ssn;
+	__u32 has_rd_atomic;
+	struct vhost_rdma_dma_info dma;
+};
+
+struct vhost_rdma_recv_wqe {
+	__aligned_u64 wr_id;
+	__u32 num_sge;
+	__u32 padding;
+	struct vhost_rdma_dma_info dma;
+};
+
+struct vhost_rdma_sq {
+	rte_spinlock_t lock; /* guard queue */
+	struct vhost_rdma_queue queue;
+};
+
+struct vhost_rdma_rq {
+	rte_spinlock_t lock; /* guard queue */
+	struct vhost_rdma_queue queue;
+};
+
 enum vhost_rdma_qp_state {
 	QP_STATE_RESET,
 	QP_STATE_INIT,
@@ -120,6 +174,7 @@ struct vhost_rdma_req_info {
 	int wait_psn;
 	int need_retry;
 	int noack_pkts;
+	struct vhost_rdma_task task;
 };
 
 struct vhost_rdma_comp_info {
@@ -130,6 +185,36 @@ struct vhost_rdma_comp_info {
 	int started_retry;
 	uint32_t retry_cnt;
 	uint32_t rnr_retry;
+	struct vhost_rdma_task task;
+};
+
+enum rdatm_res_state {
+	rdatm_res_state_next,
+	rdatm_res_state_new,
+	rdatm_res_state_replay,
+};
+
+struct resp_res {
+	int type;
+	int replay;
+	uint32_t first_psn;
+	uint32_t last_psn;
+	uint32_t cur_psn;
+	enum rdatm_res_state state;
+
+	union {
+		struct {
+			struct rte_mbuf *mbuf;
+		} atomic;
+		struct {
+			struct vhost_rdma_mr *mr;
+			uint64_t va_org;
+			uint32_t rkey;
+			uint32_t length;
+			uint64_t va;
+			uint32_t resid;
+		} read;
+	};
 };
 
 struct vhost_rdma_resp_info {
@@ -143,6 +228,27 @@ struct vhost_rdma_resp_info {
 	int sent_psn_nak;
 	enum virtio_ib_wc_status status;
 	uint8_t aeth_syndrome;
+
+	/* Receive only */
+	struct vhost_rdma_recv_wqe *wqe;
+
+	/* RDMA read / atomic only */
+	uint64_t va;
+	uint64_t offset;
+	struct vhost_rdma_mr *mr;
+	uint32_t resid;
+	uint32_t rkey;
+	uint32_t length;
+	uint64_t atomic_orig;
+
+	/* Responder resources. It's a circular list where the oldest
+	 * resource is dropped first.
+	 */
+	struct resp_res *resources;
+	unsigned int res_head;
+	unsigned int res_tail;
+	struct resp_res *res;
+	struct vhost_rdma_task task;
 };
 
 struct vhost_rdma_qp_attr {
@@ -180,16 +286,37 @@ struct vhost_rdma_qp {
 
 	uint8_t	sq_sig_all;
 
+	struct vhost_rdma_sq sq;
+	struct vhost_rdma_rq rq;
+	void *srq; // reversed
+
 	uint32_t dst_cookie;
 	uint16_t src_port;
 
 	struct vhost_rdma_av av;
 
+	struct rte_ring	*req_pkts;
+	struct rte_mbuf *req_pkts_head; // use this to support peek
+	struct rte_ring *resp_pkts;
+
 	struct vhost_rdma_req_info req;
 	struct vhost_rdma_comp_info comp;
 	struct vhost_rdma_resp_info resp;
 
+	rte_atomic32_t ssn;
+	rte_atomic32_t mbuf_out;
+	int need_req_mbuf;
+
+	/* Timer for retranmitting packet when ACKs have been lost. RC
+	 * only. The requester sets it when it is not already
+	 * started. The responder resets it whenever an ack is
+	 * received.
+	 */
+	struct rte_timer retrans_timer;
 	uint64_t qp_timeout_ticks;
+
+	/* Timer for handling RNR NAKS. */
+	struct rte_timer rnr_nak_timer;
 
 	rte_spinlock_t state_lock; /* guard requester and completer */
 
@@ -211,6 +338,10 @@ static inline int ib_mtu_enum_to_int(enum virtio_ib_mtu mtu)
 enum {
 	VHOST_NETWORK_TYPE_IPV4 = 1,
 	VHOST_NETWORK_TYPE_IPV6 = 2,
+};
+
+enum {
+	IB_MULTICAST_QPN = 0xffffff
 };
 
 void vhost_rdma_handle_ctrl(void* arg);

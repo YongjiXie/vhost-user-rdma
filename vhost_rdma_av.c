@@ -123,3 +123,16 @@ init_av_from_virtio(struct vhost_rdma_dev *dev, struct vhost_rdma_av *dst,
 
 	rte_memcpy(dst, av, sizeof(*dst));
 }
+
+struct vhost_rdma_av*
+vhost_rdma_get_av(struct vhost_rdma_pkt_info *pkt)
+{
+	if (!pkt || !pkt->qp)
+		return NULL;
+
+	if (pkt->qp->type == VIRTIO_IB_QPT_RC ||
+	    pkt->qp->type == VIRTIO_IB_QPT_UC)
+		return &pkt->qp->av;
+
+	return (pkt->wqe) ? &pkt->wqe->av : NULL;
+}
